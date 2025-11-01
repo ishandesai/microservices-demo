@@ -16,9 +16,12 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/profiler"
@@ -38,6 +41,8 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	_ "github.com/lib/pq"
 )
 
 const (
@@ -81,6 +86,9 @@ type checkoutService struct {
 
 	paymentSvcAddr string
 	paymentSvcConn *grpc.ClientConn
+
+	db            *sql.DB
+	persistOrders bool
 }
 
 func main() {
@@ -119,6 +127,16 @@ func main() {
 	mustConnGRPC(ctx, &svc.currencySvcConn, svc.currencySvcAddr)
 	mustConnGRPC(ctx, &svc.emailSvcConn, svc.emailSvcAddr)
 	mustConnGRPC(ctx, &svc.paymentSvcConn, svc.paymentSvcAddr)
+
+	if enabled := os.Getenv("ORDER_DB_ENABLED"); enabled == "1" || strings.EqualFold(enabled, "true") {
+		if err := svc.initDB(ctx); err != nil {
+			log.Fatalf("failed to initialize order persistence: %+v", err)
+		}
+		svc.persistOrders = true
+		log.Info("Order persistence enabled.")
+	} else {
+		log.Info("Order persistence disabled.")
+	}
 
 	log.Infof("service config: %+v", svc)
 
@@ -269,6 +287,10 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 		Items:              prep.orderItems,
 	}
 
+	if err := cs.saveOrder(ctx, orderID.String(), req, orderResult, txID, &total); err != nil {
+		log.Errorf("failed to persist order %q: %+v", orderID.String(), err)
+	}
+
 	if err := cs.sendOrderConfirmation(ctx, req.Email, orderResult); err != nil {
 		log.Warnf("failed to send order confirmation to %q: %+v", req.Email, err)
 	} else {
@@ -276,6 +298,156 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 	}
 	resp := &pb.PlaceOrderResponse{Order: orderResult}
 	return resp, nil
+}
+
+func (cs *checkoutService) initDB(ctx context.Context) error {
+	host := os.Getenv("DB_HOST")
+	if host == "" {
+		return fmt.Errorf("ORDER_DB_ENABLED is set but DB_HOST is empty")
+	}
+	port := os.Getenv("DB_PORT")
+	if port == "" {
+		port = "5432"
+	}
+	user := os.Getenv("DB_USER")
+	if user == "" {
+		user = "postgres"
+	}
+	password := os.Getenv("DB_PASSWORD")
+	if password == "" {
+		return fmt.Errorf("DB_PASSWORD must be provided when persistence is enabled")
+	}
+	name := os.Getenv("DB_NAME")
+	if name == "" {
+		name = "ordersdb"
+	}
+	sslMode := os.Getenv("DB_SSLMODE")
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s", host, port, user, password, name, sslMode)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return fmt.Errorf("failed to open db connection: %w", err)
+	}
+
+	db.SetMaxIdleConns(5)
+	db.SetMaxOpenConns(10)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	ctxPing, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctxPing); err != nil {
+		return fmt.Errorf("failed to ping db: %w", err)
+	}
+
+	cs.db = db
+	return cs.ensureOrdersTable(context.Background())
+}
+
+func (cs *checkoutService) ensureOrdersTable(ctx context.Context) error {
+	if cs.db == nil {
+		return nil
+	}
+
+	schema := `
+CREATE TABLE IF NOT EXISTS orders (
+    order_id VARCHAR(255) PRIMARY KEY,
+    user_id VARCHAR(255),
+    user_email VARCHAR(255),
+    user_currency VARCHAR(16),
+    shipping_address JSONB,
+    items JSONB,
+    shipping_cost JSONB,
+    total_cost JSONB,
+    transaction_id VARCHAR(255),
+    shipping_tracking_id VARCHAR(255),
+    status VARCHAR(64) DEFAULT 'completed',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+`
+
+	if _, err := cs.db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("failed creating orders table: %w", err)
+	}
+
+	if _, err := cs.db.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS idx_orders_email ON orders(user_email);
+`); err != nil {
+		return fmt.Errorf("failed creating email index: %w", err)
+	}
+
+	if _, err := cs.db.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at);
+`); err != nil {
+		return fmt.Errorf("failed creating created_at index: %w", err)
+	}
+
+	return nil
+}
+
+func (cs *checkoutService) saveOrder(ctx context.Context, orderID string, req *pb.PlaceOrderRequest, order *pb.OrderResult, txID string, total *pb.Money) error {
+	if !cs.persistOrders || cs.db == nil {
+		return nil
+	}
+
+	itemsJSON, err := json.Marshal(order.Items)
+	if err != nil {
+		return fmt.Errorf("failed to marshal items: %w", err)
+	}
+
+	shippingJSON, err := json.Marshal(order.ShippingAddress)
+	if err != nil {
+		return fmt.Errorf("failed to marshal shipping address: %w", err)
+	}
+
+	shippingCostJSON, err := json.Marshal(order.ShippingCost)
+	if err != nil {
+		return fmt.Errorf("failed to marshal shipping cost: %w", err)
+	}
+
+	totalJSON, err := json.Marshal(total)
+	if err != nil {
+		return fmt.Errorf("failed to marshal total: %w", err)
+	}
+
+	_, err = cs.db.ExecContext(ctx, `
+INSERT INTO orders (
+    order_id,
+    user_id,
+    user_email,
+    user_currency,
+    shipping_address,
+    items,
+    shipping_cost,
+    total_cost,
+    transaction_id,
+    shipping_tracking_id,
+    status,
+    created_at,
+    updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())
+ON CONFLICT (order_id) DO UPDATE SET
+    user_email = EXCLUDED.user_email,
+    user_currency = EXCLUDED.user_currency,
+    shipping_address = EXCLUDED.shipping_address,
+    items = EXCLUDED.items,
+    shipping_cost = EXCLUDED.shipping_cost,
+    total_cost = EXCLUDED.total_cost,
+    transaction_id = EXCLUDED.transaction_id,
+    shipping_tracking_id = EXCLUDED.shipping_tracking_id,
+    status = EXCLUDED.status,
+    updated_at = NOW();
+`, orderID, req.UserId, req.Email, req.UserCurrency, string(shippingJSON), string(itemsJSON), string(shippingCostJSON), string(totalJSON), txID, order.ShippingTrackingId, "completed")
+	if err != nil {
+		return fmt.Errorf("failed to insert order: %w", err)
+	}
+
+	log.Infof("order %s persisted to database", orderID)
+	return nil
 }
 
 type orderPrep struct {
